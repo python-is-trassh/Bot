@@ -4,7 +4,6 @@ from decimal import Decimal
 import random
 import asyncio
 from datetime import datetime, timedelta
-
 import psycopg2
 from psycopg2 import sql
 from psycopg2.extras import DictCursor
@@ -74,7 +73,6 @@ rate_last_updated = None
 async def get_bitcoin_rate():
     global bitcoin_rate, rate_last_updated
     
-    # Если курс устарел (больше 5 минут), обновляем
     if rate_last_updated is None or (datetime.now() - rate_last_updated).seconds > 300:
         try:
             response = requests.get(f'{BLOCKCHAIN_API_URL}ticker')
@@ -86,8 +84,7 @@ async def get_bitcoin_rate():
         except Exception as e:
             logger.error(f"Error updating Bitcoin rate: {e}")
             if bitcoin_rate is None:
-                bitcoin_rate = Decimal('3000000')  # Fallback rate
-    
+                bitcoin_rate = Decimal('3000000')
     return bitcoin_rate
 
 def satoshi_to_btc(satoshi):
@@ -142,34 +139,33 @@ async def get_available_link(location_id):
     finally:
         conn.close()
 
+# Меню
+async def set_main_menu(user_id):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    buttons = ["Каталог", "О магазине", "Курс Bitcoin"]
+    markup.add(*buttons)
+    await bot.send_message(user_id, "Главное меню:", reply_markup=markup)
+
+async def set_admin_menu(user_id):
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    buttons = [
+        "Добавить категорию", "Добавить товар",
+        "Добавить локацию", "Редактировать информацию",
+        "Выйти из админки"
+    ]
+    markup.add(*buttons)
+    await bot.send_message(user_id, "Админ меню:", reply_markup=markup)
+
 # Команды для пользователей
-@dp.message_handler(commands=['start'])
+@dp.message_handler(commands=['start', 'help'])
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "Добро пожаловать в наш магазин!\n\n"
-        "Доступные команды:\n"
-        "/categories - Просмотреть категории товаров\n"
-        "/about - О магазине\n"
-        "/rate - Текущий курс Bitcoin"
-    )
+    if message.from_user.id in ADMIN_IDS:
+        await set_admin_menu(message.from_user.id)
+    else:
+        await set_main_menu(message.from_user.id)
+    await message.answer("Добро пожаловать в наш магазин!")
 
-@dp.message_handler(commands=['about'])
-async def cmd_about(message: types.Message):
-    conn = get_db_connection()
-    try:
-        with conn.cursor(cursor_factory=DictCursor) as cursor:
-            cursor.execute("SELECT about_text FROM shop_info LIMIT 1")
-            about_text = cursor.fetchone()['about_text']
-            await message.answer(about_text)
-    finally:
-        conn.close()
-
-@dp.message_handler(commands=['rate'])
-async def cmd_rate(message: types.Message):
-    rate = await get_bitcoin_rate()
-    await message.answer(f"Текущий курс Bitcoin: {rate:.2f} RUB")
-
-@dp.message_handler(commands=['categories'])
+@dp.message_handler(text="Каталог")
 async def cmd_categories(message: types.Message):
     conn = get_db_connection()
     try:
@@ -181,7 +177,7 @@ async def cmd_categories(message: types.Message):
                 await message.answer("Категории товаров временно отсутствуют.")
                 return
             
-            keyboard = types.InlineKeyboardMarkup()
+            keyboard = types.InlineKeyboardMarkup(row_width=2)
             for category in categories:
                 keyboard.add(types.InlineKeyboardButton(
                     text=category['name'],
@@ -191,6 +187,22 @@ async def cmd_categories(message: types.Message):
             await message.answer("Выберите категорию:", reply_markup=keyboard)
     finally:
         conn.close()
+
+@dp.message_handler(text="О магазине")
+async def cmd_about(message: types.Message):
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=DictCursor) as cursor:
+            cursor.execute("SELECT about_text FROM shop_info LIMIT 1")
+            about_text = cursor.fetchone()['about_text']
+            await message.answer(about_text)
+    finally:
+        conn.close()
+
+@dp.message_handler(text="Курс Bitcoin")
+async def cmd_rate(message: types.Message):
+    rate = await get_bitcoin_rate()
+    await message.answer(f"Текущий курс Bitcoin: {rate:.2f} RUB")
 
 @dp.callback_query_handler(lambda c: c.data.startswith('category_'))
 async def process_category(callback_query: types.CallbackQuery):
@@ -209,7 +221,7 @@ async def process_category(callback_query: types.CallbackQuery):
                 await bot.answer_callback_query(callback_query.id, "В этой категории нет товаров.")
                 return
             
-            keyboard = types.InlineKeyboardMarkup()
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
             for product in products:
                 keyboard.add(types.InlineKeyboardButton(
                     text=f"{product['name']} - {product['price_rub']} RUB",
@@ -250,7 +262,7 @@ async def process_product(callback_query: types.CallbackQuery, state: FSMContext
                 await bot.answer_callback_query(callback_query.id, "Нет доступных локаций.")
                 return
             
-            keyboard = types.InlineKeyboardMarkup()
+            keyboard = types.InlineKeyboardMarkup(row_width=1)
             for location in locations:
                 keyboard.add(types.InlineKeyboardButton(
                     text=location['name'],
@@ -343,6 +355,7 @@ async def check_payment_handler(callback_query: types.CallbackQuery, state: FSMC
                     logger.error(f"Error notifying admin {admin_id}: {e}")
             
             await state.finish()
+            await set_main_menu(callback_query.from_user.id)
         else:
             await bot.send_message(
                 callback_query.from_user.id,
@@ -370,50 +383,16 @@ async def check_payment_handler(callback_query: types.CallbackQuery, state: FSMC
     
     await bot.answer_callback_query(callback_query.id)
 
-async def check_expired_orders():
-    while True:
-        conn = get_db_connection()
-        try:
-            with conn.cursor(cursor_factory=DictCursor) as cursor:
-                expired_time = datetime.now() - timedelta(minutes=30)
-                cursor.execute("""
-                    SELECT * FROM orders 
-                    WHERE is_paid = FALSE AND created_at < %s
-                """, (expired_time,))
-                expired_orders = cursor.fetchall()
-                
-                for order in expired_orders:
-                    try:
-                        await bot.send_message(
-                            order['user_id'],
-                            f"Ваш заказ #{order['id']} был отменен, так как оплата не поступила в течение 30 минут."
-                        )
-                    except Exception as e:
-                        logger.error(f"Error notifying user about expired order: {e}")
-                    
-                    cursor.execute("""
-                        UPDATE orders SET is_cancelled = TRUE WHERE id = %s
-                    """, (order['id'],))
-                    conn.commit()
-        finally:
-            conn.close()
-        
-        await asyncio.sleep(60)  # Проверяем каждую минуту
-
 # Административные команды
-@dp.message_handler(commands=['admin'], user_id=ADMIN_IDS)
-async def cmd_admin(message: types.Message):
-    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    keyboard.add("Добавить категорию", "Добавить товар")
-    keyboard.add("Добавить локацию", "Редактировать информацию")
-    keyboard.add("Отмена")
-    
-    await message.answer("Административное меню:", reply_markup=keyboard)
+@dp.message_handler(text="Выйти из админки", user_id=ADMIN_IDS)
+async def exit_admin_mode(message: types.Message):
+    await set_main_menu(message.from_user.id)
+    await message.answer("Вы вышли из админ-панели")
 
 @dp.message_handler(text="Добавить категорию", user_id=ADMIN_IDS)
 async def admin_add_category(message: types.Message):
     await AdminStates.adding_category.set()
-    await message.answer("Введите название новой категории:")
+    await message.answer("Введите название новой категории:", reply_markup=types.ReplyKeyboardRemove())
 
 @dp.message_handler(state=AdminStates.adding_category, user_id=ADMIN_IDS)
 async def process_add_category(message: types.Message, state: FSMContext):
@@ -428,6 +407,7 @@ async def process_add_category(message: types.Message, state: FSMContext):
             category_id = cursor.fetchone()[0]
             conn.commit()
             await message.answer(f"Категория '{category_name}' добавлена с ID: {category_id}")
+            await set_admin_menu(message.from_user.id)
     except Exception as e:
         logger.error(f"Error adding category: {e}")
         await message.answer("Ошибка при добавлении категории.")
@@ -447,14 +427,14 @@ async def admin_add_product(message: types.Message):
                 await message.answer("Нет активных категорий. Сначала добавьте категорию.")
                 return
             
-            keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            for category in categories:
-                keyboard.add(f"Категория {category['id']}: {category['name']}")
-            keyboard.add("Отмена")
+            markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+            buttons = [f"Категория {c['id']}: {c['name']}" for c in categories]
+            markup.add(*buttons)
+            markup.add("Отмена")
             
             await AdminStates.adding_product.set()
             await state.update_data(categories={c['id']: c['name'] for c in categories})
-            await message.answer("Выберите категорию для товара:", reply_markup=keyboard)
+            await message.answer("Выберите категорию для товара:", reply_markup=markup)
     finally:
         conn.close()
 
@@ -502,6 +482,7 @@ async def process_add_product_step2(message: types.Message, state: FSMContext):
                 product_id = cursor.fetchone()[0]
                 conn.commit()
                 await message.answer(f"Товар '{name}' добавлен с ID: {product_id}")
+                await set_admin_menu(message.from_user.id)
         finally:
             conn.close()
     except Exception as e:
@@ -510,10 +491,95 @@ async def process_add_product_step2(message: types.Message, state: FSMContext):
     finally:
         await state.finish()
 
+@dp.message_handler(text="Добавить локацию", user_id=ADMIN_IDS)
+async def admin_add_location(message: types.Message):
+    await AdminStates.adding_location.set()
+    await message.answer("Введите название новой локации:", reply_markup=types.ReplyKeyboardRemove())
+
+@dp.message_handler(state=AdminStates.adding_location, user_id=ADMIN_IDS)
+async def process_add_location(message: types.Message, state: FSMContext):
+    location_name = message.text
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO locations (name, is_active) VALUES (%s, TRUE) RETURNING id",
+                (location_name,)
+            )
+            location_id = cursor.fetchone()[0]
+            conn.commit()
+            await message.answer(f"Локация '{location_name}' добавлена с ID: {location_id}")
+            await set_admin_menu(message.from_user.id)
+    except Exception as e:
+        logger.error(f"Error adding location: {e}")
+        await message.answer("Ошибка при добавлении локации.")
+    finally:
+        conn.close()
+        await state.finish()
+
+@dp.message_handler(text="Редактировать информацию", user_id=ADMIN_IDS)
+async def admin_edit_shop_info(message: types.Message):
+    await AdminStates.editing_shop_info.set()
+    await message.answer("Введите новый текст для раздела 'О магазине':", reply_markup=types.ReplyKeyboardRemove())
+
+@dp.message_handler(state=AdminStates.editing_shop_info, user_id=ADMIN_IDS)
+async def process_edit_shop_info(message: types.Message, state: FSMContext):
+    new_text = message.text
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "UPDATE shop_info SET about_text = %s, updated_at = NOW()",
+                (new_text,)
+            )
+            conn.commit()
+            await message.answer("Текст 'О магазине' успешно обновлен!")
+            await set_admin_menu(message.from_user.id)
+    except Exception as e:
+        logger.error(f"Error updating shop info: {e}")
+        await message.answer("Ошибка при обновлении информации.")
+    finally:
+        conn.close()
+        await state.finish()
+
+# Проверка просроченных заказов
+async def check_expired_orders():
+    while True:
+        conn = get_db_connection()
+        try:
+            with conn.cursor(cursor_factory=DictCursor) as cursor:
+                expired_time = datetime.now() - timedelta(minutes=30)
+                cursor.execute("""
+                    SELECT * FROM orders 
+                    WHERE is_paid = FALSE AND created_at < %s
+                """, (expired_time,))
+                expired_orders = cursor.fetchall()
+                
+                for order in expired_orders:
+                    try:
+                        await bot.send_message(
+                            order['user_id'],
+                            f"Ваш заказ #{order['id']} был отменен, так как оплата не поступила в течение 30 минут."
+                        )
+                    except Exception as e:
+                        logger.error(f"Error notifying user about expired order: {e}")
+                    
+                    cursor.execute("""
+                        UPDATE orders SET is_cancelled = TRUE WHERE id = %s
+                    """, (order['id'],))
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Error checking expired orders: {e}")
+        finally:
+            conn.close()
+        
+        await asyncio.sleep(60)
+
 # Запуск бота
 async def on_startup(dp):
     asyncio.create_task(check_expired_orders())
     logger.info("Bot started")
+    await bot.delete_my_commands()
 
 if __name__ == '__main__':
     executor.start_polling(dp, on_startup=on_startup, skip_updates=True)
